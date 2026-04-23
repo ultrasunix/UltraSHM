@@ -31,37 +31,38 @@ import numpy as np
 import matplotlib.pyplot as plt
 from array import array
 from scipy.io import savemat
+from scipy.signal import butter, filtfilt
 from scipy.signal.windows import tukey
 from gpiozero import LED # DigitalOutputDevice
 from fn_create_gaussian_chirp import *  # Upload waveform Functions
 
 
 # ----------------------------- User-adjustable parameters -----------------------------
-PULSE_FREQ_START = 2.5e6 # Chirp Frequency Start
-PULSE_FREQ_STOP = 7.5e6  # Chirp Frequency End
-PULSE_DURATION = 50e-6   # 50 us (5-cycle at 5 MHz is 1 us)
+PULSE_FREQ_START = 2e6   # Chirp Frequency Start
+PULSE_FREQ_STOP = 8e6    # Chirp Frequency End
+PULSE_DURATION = 80e-6   # 50 us (5-cycle at 5 MHz is 1 us)
 AWG_OFFSET = 0.0         # V_offset
-AWG_AMPLITUDE = 4.0      # V_peak, i.e. 2.0 means +/-2 V, which is 4 Vpp open-circuit
-AWG_SAMPLE_FREQ = 100e6   # 10 MSa/s for arbitrary waveform synthesis
-CH1_RANGE = 4.0          # +/-2 V range; increase if clipping occurs
-SCP_SAMPLE_FREQ = 100e6   # 10 MSa/s Sampling frequency for oscilloscope acquisition; must be >= 2x F_STOP for Nyquist
+AWG_AMPLITUDE = 8.0     # V_peak, i.e. 2.0 means +/-2 V, which is 4 Vpp open-circuit
+AWG_SAMPLE_FREQ = 100e6  # 100 MSa/s for arbitrary waveform synthesis
+CH1_RANGE = 2.0          # +/-2 V range; increase if clipping occurs
+SCP_SAMPLE_FREQ = 100e6  # 100 MSa/s Sampling frequency for oscilloscope acquisition; must be >= 2x F_STOP for Nyquist
 SCP_SAMPLE_RATE = 14     # 14-bit vertical resolution; adjust if needed
 ACQ_DURATION = 300e-6    # 1.0 ms capture window
 PRETRIGGER_RATIO = 0.1   # 10% pre-trigger
-REFRESH_INTERVAL = 0.5   # seconds
+REFRESH_INTERVAL = 0.5  # seconds
 PH_VELOCITY = 5850       # Material Ph_velocity m/s
 TX_MIN = 1               # Minimum Tx CHannel
-TX_MAX = 32               # Maximum Tx CHannel
-RX_MIN = 30               # Minimum Rx CHannel
-RX_MAX = 30              # Maximum Rx CHannel
-ACQ_NUM = 1              # Average Number
+TX_MAX = 32              # Maximum Tx CHannel
+RX_MIN = 1               # Minimum Rx CHannel
+RX_MAX = 32              # Maximum Rx CHannel
+ACQ_NUM = 2              # Average Number
 MUX_CHIP_NUM = 4         # current max is 4
 MUX_CHANNEL_NUM = 16     # current max is 16
 SAVE_DATA = True
 HAVE_PRINTINFO = False
 NUM_TIME_POINTS = int(np.ceil(ACQ_DURATION * SCP_SAMPLE_FREQ))  # Number of time points in acquisition
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SAVE_FILENAME = os.path.join(SCRIPT_DIR, "sdata-fmc-32els-5mhz-sdh.mat")
+SAVE_FILENAME = os.path.join(SCRIPT_DIR, "sdata-fmc-32els-5mhz-fbh-b3-aveg.mat")
 
 
 # ---------- Connection Settings ----------
@@ -222,7 +223,15 @@ def acquire_one_trace(scp, gen):
     return np.asarray(ch1, dtype=np.float64)
 
 
-def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity, tx, rx):
+def apply_highpass_iir(x, fs, cutoff=20e3, order=4):
+    nyq = 0.5 * fs
+    wn = cutoff / nyq
+    b, a = butter(order, wn, btype='highpass')
+    y = filtfilt(b, a, x)
+    return y, b, a
+
+
+def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity, tx, rx, buttera, butterb):
 
     exp_data = {
         'exp_data': {
@@ -232,6 +241,8 @@ def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity
             'tx': np.asarray(tx).reshape(-1, 1),
             'rx': np.asarray(rx).reshape(-1, 1),
             'ph_velocity': np.array([[ph_velocity]]),
+            'pf_butter_a': np.array([[buttera]]),
+            'pf_butter_b': np.array([[butterb]]),
             'signal_amp': np.array([[signal_amp]]),   # scalar → 1x1
             'scope_sens': np.array([[scope_sens]]),
         }
@@ -279,6 +290,7 @@ def set_switches(HEX_CHT, HEX_CHR, SWMX):
         MXT1.off()
     elif SWMX[1]:
         MXT2.off()
+        
     
     msb = (HEX_CHT >> 8) & 0xFF
     lsb = HEX_CHT & 0xFF
@@ -383,9 +395,10 @@ def main():
         configure_generator(gen, awg_wave, AWG_SAMPLE_FREQ)
         configure_scope(scp)
         close_switches(0) # close all channels by setting as 0x00
+        time.sleep(1)
 
         plt.ion()
-        fig, ax = plt.subplots(figsize=(10, 5))
+        fig, ax = plt.subplots(figsize=(12, 9))
         line, = ax.plot(t * 1e6, np.zeros_like(t))
         ax.set_ylim(-CH1_RANGE, CH1_RANGE)
         ax.set_xlabel("Time (us)")
@@ -402,14 +415,22 @@ def main():
         all_traces = []
 
         for tr in range(0, len(tx), 1):
-            ii = num_els*(tx[tr]-2)+(rx[tr]-1)
+            ii = num_els*(tx[tr]-1)+rx[tr]
+            
+            if ((tr>0) and (ITOT[(ii-1), 2] != ITOT[(idx), 2])) or (tr>0) and (ITOT[(ii-1), 0] != ITOT[(idx), 0]):
+                close_switches(0) # close all channels by setting as 0x00
+                
+            idx = ii-1
+            
             set_switches(int(array_hex[tx[tr]-1],16), int(array_hex[rx[tr]-1],16), ITOT[(ii-1),:])
+            time.sleep(0.01)
             
             # GET DATA
             time_data = np.zeros((len(t),),dtype=float)
             
             for an in range(0, ACQ_NUM, 1):
-                time_data += acquire_one_trace(scp, gen)
+                tmp, butterb, buttera = apply_highpass_iir(acquire_one_trace(scp, gen), SCP_SAMPLE_FREQ, cutoff=50e3, order=3)
+                time_data += tmp
                 
                 line.set_ydata(time_data)
                 ax.relim()
@@ -431,7 +452,7 @@ def main():
         
         if SAVE_DATA and len(all_traces) > 0:
             data_matrix = np.column_stack(all_traces)   # shape: N x M
-            save_data_mat(SAVE_FILENAME, t, data_matrix, awg_wave, AWG_AMPLITUDE, CH1_RANGE, PH_VELOCITY, tx, rx)
+            save_data_mat(SAVE_FILENAME, t, data_matrix, awg_wave, AWG_AMPLITUDE, CH1_RANGE, PH_VELOCITY, tx, rx, buttera, butterb)
 
     finally:
         try:

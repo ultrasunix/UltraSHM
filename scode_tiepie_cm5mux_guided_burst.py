@@ -25,6 +25,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from array import array
 from scipy.io import savemat
+from scipy.signal import butter, filtfilt
 from scipy.signal.windows import tukey
 from gpiozero import LED # DigitalOutputDevice
 from fn_create_tone_burst import *  # Upload waveform Functions
@@ -45,11 +46,11 @@ ACQ_DURATION = 6.0e-3    # capture window
 PRETRIGGER_RATIO = 0.1   # 10% pre-trigger
 REFRESH_INTERVAL = 0.5   # seconds
 PH_VELOCITY = 1800       # Material Ph_velocity m/s
-TX_MIN = 11             # Minimum Tx CHannel [1-32]
-TX_MAX = 11            # Maximum Tx CHannel [1-32]
+TX_MIN = 16             # Minimum Tx CHannel [1-32]
+TX_MAX = 16            # Maximum Tx CHannel [1-32]
 RX_MIN = 1            # Minimum Rx CHannel [1-32]
 RX_MAX = 32              # Maximum Rx CHannel [1-32]
-ACQ_NUM = 2              # Average Number
+ACQ_NUM = 1              # Average Number
 MUX_CHIP_NUM = 4         # current max is 4
 MUX_CHANNEL_NUM = 16     # current max is 16
 SAVE_DATA = False
@@ -217,7 +218,15 @@ def acquire_one_trace(scp, gen):
     return np.asarray(ch1, dtype=np.float64)
 
 
-def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity, tx, rx):
+def apply_highpass_iir(x, fs, cutoff=20e3, order=4):
+    nyq = 0.5 * fs
+    wn = cutoff / nyq
+    b, a = butter(order, wn, btype='highpass')
+    y = filtfilt(b, a, x)
+    return y, b, a
+
+
+def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity, tx, rx, buttera, butterb):
 
     exp_data = {
         'exp_data': {
@@ -227,6 +236,8 @@ def save_data_mat(filename, t, data, signal, signal_amp, scope_sens, ph_velocity
             'tx': np.asarray(tx).reshape(-1, 1),
             'rx': np.asarray(rx).reshape(-1, 1),
             'ph_velocity': np.array([[ph_velocity]]),
+            'pf_butter_a': np.array([[buttera]]),
+            'pf_butter_b': np.array([[butterb]]),
             'signal_amp': np.array([[signal_amp]]),   # scalar → 1x1
             'scope_sens': np.array([[scope_sens]]),
         }
@@ -397,13 +408,20 @@ def main():
 
         for tr in range(0, len(tx), 1):
             ii = num_els*(tx[tr]-1)+rx[tr]
+            
+            if ((tr>0) and (ITOT[(ii-1), 2] != ITOT[(idx), 2])) or (tr>0) and (ITOT[(ii-1), 0] != ITOT[(idx), 0]):
+                close_switches(0) # close all channels by setting as 0x00
+                
+            idx = ii-1 # Record the least FMC index
+            
             set_switches(int(array_hex[tx[tr]-1],16), int(array_hex[rx[tr]-1],16), ITOT[(ii-1),:])
             
             # GET DATA
             time_data = np.zeros((len(t),),dtype=float)
             
             for an in range(0, ACQ_NUM, 1):
-                time_data += acquire_one_trace(scp, gen)
+                tmp, butterb, buttera = apply_highpass_iir(acquire_one_trace(scp, gen), SCP_SAMPLE_FREQ, cutoff=50e3, order=3)
+                time_data += tmp
                 
                 line.set_ydata(time_data)
                 ax.relim()
@@ -425,7 +443,7 @@ def main():
         
         if SAVE_DATA and len(all_traces) > 0:
             data_matrix = np.column_stack(all_traces)   # shape: N x M
-            save_data_mat(SAVE_FILENAME, t, data_matrix, awg_wave, AWG_AMPLITUDE, CH1_RANGE, PH_VELOCITY, tx, rx)
+            save_data_mat(SAVE_FILENAME, t, data_matrix, awg_wave, AWG_AMPLITUDE, CH1_RANGE, PH_VELOCITY, tx, rx, buttera, butterb)
 
     finally:
         try:
